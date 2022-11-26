@@ -34,6 +34,7 @@ std = [
     "ink_primitives/std",
     "ink_metadata/std",
     "ink_env/std",
+    "ink_env/ink-debug",
     "ink_storage/std",
     "ink_lang/std",
     "scale/std",

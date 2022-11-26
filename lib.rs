@@ -78,7 +78,7 @@ mod staking {
                 if let Some(new_balance) = balance.checked_add(transferred_amount) {
                     let new_staking_position = StakingPosition {
                         stake_amount: new_balance,
-                        last_action_block: self.env().block_number(),
+                        last_action_block: staking_position.last_action_block,
                     };
                     self.stake_positions.insert(caller, &new_staking_position);
                 } else {
@@ -105,11 +105,99 @@ mod staking {
             Ok(())
         }
 
+        #[ink(message)]
         pub fn unstake(&mut self, unstake_amount: Balance) -> Result<(), StakingError> {
+            assert!(unstake_amount > 0, "Must unstake more than 0");
+
+            let caller = self.env().caller();
+            let staking_position = self.stake_positions.get(&caller);
+            if let Some(user_stake) = staking_position {
+                if unstake_amount > user_stake.stake_amount {
+                    return Err(StakingError::UnstakeError(
+                        "unstake amount cannot be greater than staked amount".to_owned(),
+                    ));
+                } else {
+                    if let Some(rest_stake) = user_stake.stake_amount.checked_sub(unstake_amount) {
+                        if rest_stake == 0 {
+                            let idx = self
+                                .staked_addresses
+                                .iter()
+                                .position(|x| *x == caller)
+                                .unwrap();
+                            self.staked_addresses.remove(idx);
+
+                            if let Err(e) = self.claim_reward() {
+                                return Err(StakingError::Other(format!(
+                                    "Failed to claim all the rewards after unstaking: {:?}",
+                                    e
+                                )));
+                            }
+                        }
+
+                        
+                        if self.env().transfer(caller, unstake_amount).is_err() {
+                            panic!("failed to transfer unstaked amount")
+                        }
+
+                        self.stake_positions.insert(
+                            caller,
+                            &StakingPosition {
+                                stake_amount: rest_stake,
+                                last_action_block: self.env().block_number(),
+                            },
+                        );
+
+                        self.env().emit_event(Unstaked {
+                            user: caller,
+                            amount: unstake_amount,
+                        });
+                    } else {
+                        return Err(StakingError::Other(
+                            "Overflow error while substractiong stakes".to_owned(),
+                        ));
+                    }
+                }
+            } else {
+                return Err(StakingError::UnstakeError(
+                    "can only unstake if user has already staked".to_owned(),
+                ));
+            }
+
             Ok(())
         }
 
+        #[ink(message)]
         pub fn claim_reward(&mut self) -> Result<(), StakingError> {
+            let caller = self.env().caller();
+            let reward = self.rewards_for_user(caller);
+
+            if let Some(staking_position) = self.stake_positions.get(caller) {
+                self.stake_positions.insert(
+                    caller,
+                    &StakingPosition {
+                        stake_amount: staking_position.stake_amount,
+                        last_action_block: self.env().block_number(),
+                    },
+                );
+
+                if reward > 0 {
+                    if self.env().transfer(caller, reward).is_err() {
+                        return Err(StakingError::ClaimingRewardError(
+                            "failed to transfer claimed reward to user".to_owned(),
+                        ));
+                    }
+
+                    self.env().emit_event(Claimed {
+                        amount: reward,
+                        user: caller,
+                    });
+                }
+            } else {
+                return Err(StakingError::ClaimingRewardError(
+                    "user doesnt seem to have a stake".to_owned(),
+                ));
+            }
+
             Ok(())
         }
 
@@ -120,6 +208,27 @@ mod staking {
                 _ => Balance::from(0u128),
             }
         }
+
+        #[ink(message)]
+        pub fn rewards_for_user(&self, user: AccountId) -> Balance {
+            let staking_position = self.stake_positions.get(user);
+            match staking_position {
+                Some(stake) => self.calculate_rewards(&stake),
+                _ => Balance::from(0u128),
+            }
+        }
+
+        fn calculate_rewards(&self, staking_position: &StakingPosition) -> Balance {
+            let current_block = self.env().block_number();
+            if current_block <= staking_position.last_action_block {
+                return Balance::from(0u128);
+            }
+
+            current_block
+                .checked_sub(staking_position.last_action_block)
+                .unwrap()
+                .into()
+        }
     }
 
     #[cfg(test)]
@@ -127,19 +236,17 @@ mod staking {
         use super::*;
 
         use ink_lang as ink;
+        use ink_lang::codegen::Env;
 
         use ink_env::{
-            test::{
-                default_accounts, get_account_balance, recorded_events, DefaultAccounts,
-                EmittedEvent,
-            },
+            test::{default_accounts, get_account_balance, EmittedEvent},
             AccountId,
         };
 
         type Event = <Staking as ink::reflect::ContractEventBase>::Type;
 
         fn assert_staked_event(
-            event: &ink_env::test::EmittedEvent,
+            event: &EmittedEvent,
             expected_user: &AccountId,
             expected_amount: Balance,
         ) {
@@ -154,7 +261,7 @@ mod staking {
         }
 
         fn assert_unstaked_event(
-            event: &ink_env::test::EmittedEvent,
+            event: &EmittedEvent,
             expected_user: &AccountId,
             expected_amount: Balance,
         ) {
@@ -169,7 +276,7 @@ mod staking {
         }
 
         fn assert_claimed_event(
-            event: &ink_env::test::EmittedEvent,
+            event: &EmittedEvent,
             expected_user: &AccountId,
             expected_amount: Balance,
         ) {
@@ -201,6 +308,15 @@ mod staking {
             let stake = ink_env::pay_with_call!(staking_contract_instance.stake(), 10);
             assert_eq!(stake, Ok(()));
             assert_eq!(staking_contract_instance.get_account_stake(alice), 10);
+
+            // contract now has 10 coins more
+            let contract_balance = get_account_balance::<ink_env::DefaultEnvironment>(
+                staking_contract_instance.env().account_id(),
+            )
+            .unwrap();
+            assert_eq!(1000010, contract_balance);
+
+            assert!(staking_contract_instance.staked_addresses.contains(&alice));
 
             let emitted_events = ink_env::test::recorded_events().collect::<Vec<_>>();
             assert_eq!(1, emitted_events.len());
@@ -239,29 +355,32 @@ mod staking {
         fn claiming_should_work() {
             let alice = default_accounts::<ink_env::DefaultEnvironment>().alice;
             ink_env::test::set_caller::<ink_env::DefaultEnvironment>(alice);
-            let alice_balance =
-                ink_env::test::get_account_balance::<ink_env::DefaultEnvironment>(alice).unwrap();
+            let alice_balance = get_account_balance::<ink_env::DefaultEnvironment>(alice).unwrap();
             assert_eq!(alice_balance, 1000000);
 
             let mut staking_contract_instance = Staking::new(1000);
 
             let _ = ink_env::pay_with_call!(staking_contract_instance.stake(), 10);
+
             assert_eq!(staking_contract_instance.get_account_stake(alice), 10);
 
             for _ in 0..5 {
                 ink_env::test::advance_block::<ink_env::DefaultEnvironment>();
             }
 
+            let to_be_claimed = staking_contract_instance.rewards_for_user(alice);
+            assert_eq!(5, to_be_claimed);
+
             let claim = staking_contract_instance.claim_reward();
             assert_eq!(claim, Ok(()));
 
-            let alice_balance =
-                ink_env::test::get_account_balance::<ink_env::DefaultEnvironment>(alice).unwrap();
-            assert_eq!(alice_balance, 1000005);
+            let alice_balance = get_account_balance::<ink_env::DefaultEnvironment>(alice).unwrap();
+            assert_eq!(alice_balance, 1000015);
 
             let emitted_events = ink_env::test::recorded_events().collect::<Vec<_>>();
-            assert_eq!(1, emitted_events.len());
-            assert_claimed_event(&emitted_events[0], &alice, 5);
+            assert_eq!(2, emitted_events.len());
+            assert_staked_event(&emitted_events[0], &alice, 10);
+            assert_claimed_event(&emitted_events[1], &alice, 5);
         }
 
         #[ink::test]
@@ -275,7 +394,7 @@ mod staking {
             assert_eq!(
                 claim,
                 Err(StakingError::ClaimingRewardError(
-                    "cannot claim rewards with no stake".to_owned()
+                    "user doesnt seem to have a stake".to_owned()
                 ))
             )
         }
@@ -294,10 +413,34 @@ mod staking {
             let unstake_result = staking_contract_instance.unstake(10);
             assert_eq!(unstake_result, Ok(()));
             assert_eq!(staking_contract_instance.get_account_stake(alice), 0);
+            assert_eq!(staking_contract_instance.staked_addresses.contains(&alice), false);
 
             let emitted_events = ink_env::test::recorded_events().collect::<Vec<_>>();
-            assert_eq!(1, emitted_events.len());
-            assert_unstaked_event(&emitted_events[0], &alice, 10);
+            assert_eq!(2, emitted_events.len());
+            assert_staked_event(&emitted_events[0], &alice, 10);
+            assert_unstaked_event(&emitted_events[1], &alice, 10);
+        }
+
+        #[ink::test]
+        fn partial_unstake_should_work() {
+            let alice = default_accounts::<ink_env::DefaultEnvironment>().alice;
+            ink_env::test::set_caller::<ink_env::DefaultEnvironment>(alice);
+
+            let mut staking_contract_instance = Staking::new(1000);
+            assert_eq!(staking_contract_instance.get_account_stake(alice), 0);
+
+            let _ = ink_env::pay_with_call!(staking_contract_instance.stake(), 10);
+            assert_eq!(staking_contract_instance.get_account_stake(alice), 10);
+
+            let unstake_result = staking_contract_instance.unstake(5);
+            assert_eq!(unstake_result, Ok(()));
+            assert_eq!(staking_contract_instance.get_account_stake(alice), 5);
+            assert!(staking_contract_instance.staked_addresses.contains(&alice));
+
+            let emitted_events = ink_env::test::recorded_events().collect::<Vec<_>>();
+            assert_eq!(2, emitted_events.len());
+            assert_staked_event(&emitted_events[0], &alice, 10);
+            assert_unstaked_event(&emitted_events[1], &alice, 5);
         }
 
         #[ink::test]
@@ -330,9 +473,51 @@ mod staking {
             assert_eq!(
                 unstake,
                 Err(StakingError::UnstakeError(
-                    "cannot stake more than staked amount".to_owned()
+                    "unstake amount cannot be greater than staked amount".to_owned()
                 ))
             )
+        }
+
+        #[ink::test]
+        fn unstake_should_work_iff_user_has_staked() {
+            let alice = default_accounts::<ink_env::DefaultEnvironment>().alice;
+            ink_env::test::set_caller::<ink_env::DefaultEnvironment>(alice);
+
+            let mut staking_contract_instance = Staking::new(1000);
+            let unstake = staking_contract_instance.unstake(1);
+            assert_eq!(
+                unstake,
+                Err(StakingError::UnstakeError(
+                    "can only unstake if user has already staked".to_owned()
+                ))
+            )
+        }
+
+        #[ink::test]
+        fn unstake_all_must_trigger_reward_claiming() {
+            let alice = default_accounts::<ink_env::DefaultEnvironment>().alice;
+            ink_env::test::set_caller::<ink_env::DefaultEnvironment>(alice);
+
+            let mut staking_contract_instance = Staking::new(1000);
+
+            let _ = ink_env::pay_with_call!(staking_contract_instance.stake(), 10);
+            assert_eq!(staking_contract_instance.get_account_stake(alice), 10);
+
+            for _ in 0..5 {
+                ink_env::test::advance_block::<ink_env::DefaultEnvironment>();
+            }
+
+            let to_be_claimed = staking_contract_instance.rewards_for_user(alice);
+            assert_eq!(5, to_be_claimed);
+
+            let unstake_result = staking_contract_instance.unstake(10);
+            assert_eq!(Ok(()), unstake_result);
+
+            let to_be_claimed = staking_contract_instance.rewards_for_user(alice);
+            assert_eq!(0, to_be_claimed);
+
+            let alice_balance = get_account_balance::<ink_env::DefaultEnvironment>(alice).unwrap();
+            assert_eq!(1000025, alice_balance);
         }
     }
 }
