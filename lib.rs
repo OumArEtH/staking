@@ -118,6 +118,14 @@ mod staking {
                     ));
                 } else {
                     if let Some(rest_stake) = user_stake.stake_amount.checked_sub(unstake_amount) {
+                        if let Err(e) = self.claim_reward() {
+                            return Err(StakingError::Other(format!(
+                                "Failed to claim all the rewards after unstaking: {:?}",
+                                e
+                            )));
+                        }
+
+                        // update staking information
                         if rest_stake == 0 {
                             let idx = self
                                 .staked_addresses
@@ -126,25 +134,20 @@ mod staking {
                                 .unwrap();
                             self.staked_addresses.remove(idx);
 
-                            if let Err(e) = self.claim_reward() {
-                                return Err(StakingError::Other(format!(
-                                    "Failed to claim all the rewards after unstaking: {:?}",
-                                    e
-                                )));
-                            }
+                            self.stake_positions.remove(caller);
+                        } else {
+                            self.stake_positions.insert(
+                                caller,
+                                &StakingPosition {
+                                    stake_amount: rest_stake,
+                                    last_action_block: self.env().block_number(),
+                                },
+                            );
                         }
 
                         if self.env().transfer(caller, unstake_amount).is_err() {
                             panic!("failed to transfer unstaked amount")
                         }
-
-                        self.stake_positions.insert(
-                            caller,
-                            &StakingPosition {
-                                stake_amount: rest_stake,
-                                last_action_block: self.env().block_number(),
-                            },
-                        );
 
                         self.env().emit_event(Unstaked {
                             user: caller,
@@ -496,7 +499,7 @@ mod staking {
         }
 
         #[ink::test]
-        fn unstake_all_must_trigger_reward_claiming() {
+        fn unstake_must_trigger_reward_claiming() {
             let alice = default_accounts::<ink_env::DefaultEnvironment>().alice;
             ink_env::test::set_caller::<ink_env::DefaultEnvironment>(alice);
 
