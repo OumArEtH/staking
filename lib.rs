@@ -134,7 +134,6 @@ mod staking {
                             }
                         }
 
-                        
                         if self.env().transfer(caller, unstake_amount).is_err() {
                             panic!("failed to transfer unstaked amount")
                         }
@@ -413,7 +412,10 @@ mod staking {
             let unstake_result = staking_contract_instance.unstake(10);
             assert_eq!(unstake_result, Ok(()));
             assert_eq!(staking_contract_instance.get_account_stake(alice), 0);
-            assert_eq!(staking_contract_instance.staked_addresses.contains(&alice), false);
+            assert_eq!(
+                staking_contract_instance.staked_addresses.contains(&alice),
+                false
+            );
 
             let emitted_events = ink_env::test::recorded_events().collect::<Vec<_>>();
             assert_eq!(2, emitted_events.len());
